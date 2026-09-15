@@ -959,10 +959,9 @@ class Sensor:
 
         return rc
 
-    def match_finger(self) -> typing.Tuple[int, int, bytes]:
+    def match_finger(self, usr_id: int = 0) -> typing.Tuple[int, int, bytes]:
         try:
             stg_id = 0  # match against any storage
-            usr_id = 0  # match against any user
             cmd = pack('<BBBHHHHH', 0x5e, 2, 0xff, stg_id, usr_id, 1, 0, 0)
             rsp = tls.app(cmd)
             assert_status(rsp)
@@ -975,12 +974,27 @@ class Sensor:
             # physical 138a:00ab / 0xd51 firmware also emitted 4 after reboot.
             # Match the complete observed packet so unrelated interrupt 4/5
             # failures are not accidentally classified as a false negative.
-            no_template_packets = {
-                b'\x04\x00\x01\x00\xdb',
-                b'\x05\x00\x01\x00\xdb',
-            }
+            # 0xd51/0x969 firmware emits a family of clean on-chip
+            # no-template responses. On physical 0xd51 hardware the third
+            # byte has been observed as 0x01, 0x02, 0x03, ... as more Linux
+            # fingerprint templates are enrolled. Treat the bounded 1..10
+            # family as a normal wrong-finger result rather than hardcoding
+            # every enrollment count one by one.
+            #
+            # A second observed multi-template form is 05 00 31 04 db.
+            # Keep that exact because its payload shape is different.
+            no_template_count_family = (
+                len(b) == 5
+                and b[0] in (4, 5)
+                and b[1] == 0
+                and b[3] == 0
+                and 1 <= b[2] <= 10
+                and b[4] == 0xdb
+            )
+            no_template_special = b == b'\x05\x00\x31\x04\xdb'
+
             if (getattr(self, 'real_device_type', None) in (0xd51, 0x969)
-                    and b in no_template_packets):
+                    and (no_template_count_family or no_template_special)):
                 raise FingerNotMatchedException(
                     'No-template interrupt for sensor 0x%x: %s'
                     % (self.real_device_type, hexlify(b).decode()))
@@ -1003,10 +1017,86 @@ class Sensor:
             usrid, = unpack('<L', usrid)
             subtype, = unpack('<H', subtype)
 
+            logging.debug(
+                'Matcher result: requested_user=%d matched_user=%d subtype=0x%02x',
+                usr_id, usrid, subtype)
+
+            # Windows Hello records can coexist in StgWindsor on 0xd51/0x969
+            # and use Microsoft-private finger slots 0xf5..0xfe. Never return
+            # one of those records as a successful Linux authentication.
+            if (getattr(self, 'real_device_type', None) in (0xd51, 0x969)
+                    and 0xf5 <= subtype <= 0xfe):
+                raise FingerNotMatchedException(
+                    'Matched Windows-only template: user=%d subtype=0x%02x'
+                    % (usrid, subtype))
+
+            # When verification requests a concrete Linux DB user, the chip
+            # must not be allowed to authenticate any other on-sensor record.
+            if usr_id != 0 and usrid != usr_id:
+                raise FingerNotMatchedException(
+                    'Matcher returned unexpected user %d (requested %d)'
+                    % (usrid, usr_id))
+
             return usrid, subtype, hsh
         finally:
-            # cleanup, ignore any errors
-            tls.app(unhexlify('6200000000'))
+            # Matcher cleanup must never hide the real match/no-match result.
+            try:
+                tls.app(unhexlify('6200000000'))
+            except Exception:
+                logging.exception('Matcher cleanup failed')
+
+    def verify(self, usr_id: int, update_cb: typing.Callable[[Exception], None],
+               max_match_attempts: int = 3):
+        """Verify one Linux user with up to three wrong-finger attempts.
+
+        Capture-quality/idle failures retry silently and do not consume a
+        match attempt. A completed wrong/foreign match consumes one attempt.
+        After each wrong match, the current scan session is fully ended before
+        a short debounce delay and the next scan starts. This avoids counting
+        one lingering physical touch twice without blocking the next real touch.
+        """
+        match_attempts = 0
+
+        while True:
+            retry_after_wrong = False
+            glow_start_scan()
+            try:
+                try:
+                    self.capture(CaptureMode.IDENTIFY)
+                except usb_core.USBError as e:
+                    raise e
+                except CancelledException as e:
+                    raise e
+                except Exception as e:
+                    # Idle/blank/poor-contact captures are not wrong fingers.
+                    logging.debug('Capture rejected before matching: %s', e)
+                    sleep(0.25)
+                    continue
+
+                try:
+                    return self.match_finger(usr_id)
+                except FingerNotMatchedException as e:
+                    match_attempts += 1
+                    logging.info(
+                        'Fingerprint did not match requested Linux user '
+                        '(attempt %d/%d, user_id=%d)',
+                        match_attempts, max_match_attempts, usr_id)
+
+                    if match_attempts >= max_match_attempts:
+                        raise
+
+                    # Only genuine completed wrong/foreign matches reach the
+                    # callback, so one callback == one visible retry-scan.
+                    update_cb(e)
+                    retry_after_wrong = True
+            finally:
+                glow_end_scan()
+
+            if retry_after_wrong:
+                # Let the user remove the previous finger before arming the
+                # next capture. Do not attempt to infer finger release from
+                # 0xd51 timing; doing that can swallow the next real touch.
+                sleep(1.0)
 
     def identify(self, update_cb: typing.Callable[[Exception], None]):
         while True:
