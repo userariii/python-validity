@@ -899,6 +899,12 @@ class Sensor:
         def do_create_finger(final_template: bytes, tid: bytes):
             tinfo = self.make_finger_data(subtype, final_template, tid)
 
+            # StgWindsor is shared with Windows Hello.  Protect real allocatable
+            # headroom before deleting/replacing anything, because deleted
+            # records may remain as unreclaimed flash slack on this firmware.
+            if getattr(self, 'real_device_type', None) in (0xd51, 0x969):
+                db.require_enrollment_headroom(len(tinfo))
+
             existing = db.lookup_user(identity)
             if existing is None:
                 usr = db.new_user(identity)

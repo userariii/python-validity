@@ -136,9 +136,15 @@ class Db:
             self.records = records  # total number, including deleted
             self.roots = roots
 
+        @property
+        def deleted_slack(self) -> int:
+            return max(0, self.total - self.used - self.free)
+
         def __repr__(self):
-            return 'Db.Info(total=%d, used=%d, free=%d, records=%d, roots=%s)' % (
-                self.total, self.used, self.free, self.records, repr(self.roots))
+            return ('Db.Info(total=%d, used=%d, free=%d, deleted_slack=%d, '
+                    'records=%d, roots=%s)' %
+                    (self.total, self.used, self.free, self.deleted_slack,
+                     self.records, repr(self.roots)))
 
     def get_user_storage(self, dbid=0, name=''):
         name = name.encode()
@@ -218,6 +224,28 @@ class Db:
         roots = [unpack('<H', rsp[i * 2:i * 2 + 2])[0] for i in range(0, nroots)]
 
         return Db.Info(total, used, free, records, roots)
+
+    def require_enrollment_headroom(self, record_size: int,
+                                    reserve: int = 96 * 1024):
+        """Keep real free space available for the other OS in dual boot.
+
+        Windows Hello and python-validity share the same StgWindsor database.
+        Deleted records on this firmware are not immediately reusable, so only
+        ``info.free`` counts as allocatable space.  Refuse a Linux enrollment
+        before it can consume the transaction headroom Windows needs for a
+        later enrollment.
+        """
+        info = self.db_info()
+        required = record_size + 64
+        remaining = info.free - required
+        if remaining < reserve:
+            raise Exception(
+                'Dual-boot fingerprint DB headroom protection: free=%d bytes, '
+                'new record needs ~%d bytes, reserve=%d bytes, '
+                'deleted/unreclaimed=%d bytes. Refusing this Linux enrollment '
+                'so Windows Hello keeps enough allocatable DB space. '
+                'Run `sudo validity-db-info` for details.'
+                % (info.free, required, reserve, info.deleted_slack))
 
     def new_record(self, parent: int, typ: int, storage: int, data: bytes):
         info = self.db_info()

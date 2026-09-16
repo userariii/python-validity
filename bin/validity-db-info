@@ -1,0 +1,178 @@
+#!/usr/bin/python3
+import argparse
+import os
+import subprocess
+import sys
+
+
+def human_bytes(value: int) -> str:
+    value = int(value)
+    units = ('B', 'KiB', 'MiB', 'GiB')
+    amount = float(value)
+    for unit in units:
+        if amount < 1024 or unit == units[-1]:
+            if unit == 'B':
+                return f'{value} B'
+            return f'{amount:.2f} {unit}'
+        amount /= 1024
+
+
+def systemctl(*args):
+    return subprocess.run(
+        ['systemctl', *args],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
+def service_is_active(name: str) -> bool:
+    return subprocess.run(
+        ['systemctl', 'is-active', '--quiet', name],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).returncode == 0
+
+
+def classify_finger(subtype: int) -> str:
+    if 1 <= subtype <= 10:
+        return 'Linux/fprintd'
+    if 0xF5 <= subtype <= 0xFE:
+        return 'Windows Hello/private'
+    return 'Other/unknown'
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description='Inspect the python-validity on-sensor fingerprint database.'
+    )
+    parser.add_argument(
+        '--no-service-control',
+        action='store_true',
+        help='Do not stop/restart python3-validity automatically.',
+    )
+    args = parser.parse_args()
+
+    if os.geteuid() != 0:
+        print('This command needs direct USB access. Run it with sudo:', file=sys.stderr)
+        print('  sudo validity-db-info', file=sys.stderr)
+        return 1
+
+    was_active = False
+    if not args.no_service_control:
+        was_active = service_is_active('python3-validity.service')
+        if was_active:
+            print('Stopping python3-validity for direct sensor access...')
+            result = systemctl('stop', 'python3-validity.service')
+            if result.returncode != 0:
+                print('Warning: systemctl stop did not complete cleanly; continuing.', file=sys.stderr)
+
+    try:
+        # Import only after service handling, so startup/import failures do not
+        # leave the service stopped unnecessarily.
+        from validitysensor.init import open as sensor_open
+        from validitysensor.db import db, subtype_to_string
+        from validitysensor.flash import get_flash_info
+
+        sensor_open()
+
+        info = db.db_info()
+        flash = get_flash_info()
+        db_partition = next((p for p in flash.partitions if p.id == 4), None)
+
+        reclaimable = max(0, info.total - info.used - info.free)
+
+        print()
+        print('Fingerprint database')
+        print('====================')
+        print(f'DB total:        {info.total:8d} bytes  ({human_bytes(info.total)})')
+        print(f'Active used:     {info.used:8d} bytes  ({human_bytes(info.used)})')
+        print(f'Free/unallocated:{info.free:8d} bytes  ({human_bytes(info.free)})')
+        print(f'Deleted/slack:   {reclaimable:8d} bytes  ({human_bytes(reclaimable)})')
+        print(f'Records:         {info.records}')
+        print(f'Root records:    {info.roots}')
+
+        if db_partition is not None:
+            print()
+            print('Flash partition 4')
+            print('-----------------')
+            print(f'Size:            {db_partition.size:8d} bytes  ({human_bytes(db_partition.size)})')
+            print(f'Offset:          0x{db_partition.offset:08x}')
+            print(f'Access level:    0x{db_partition.access_lvl:04x}')
+            if db_partition.size != info.total:
+                print('Note: DB-reported total differs from raw partition size.')
+
+        stg = db.get_user_storage(name='StgWindsor')
+        print()
+        print('StgWindsor')
+        print('----------')
+        if stg is None:
+            print('Storage not found.')
+            return 0
+
+        print(f'Storage DBID:    {stg.dbid}')
+        print(f'Users:           {len(stg.users)}')
+
+        linux_fingers = 0
+        windows_fingers = 0
+        other_fingers = 0
+
+        for entry in stg.users:
+            usr = db.get_user(entry['dbid'])
+            print()
+            print(f'User DBID {usr.dbid}: {usr.identity!r}')
+            print(f'  User value size: {entry.get("valueSize", 0)} bytes')
+
+            if not usr.fingers:
+                print('  No fingerprint records')
+                continue
+
+            for finger in usr.fingers:
+                subtype = finger['subtype']
+                family = classify_finger(subtype)
+                name = subtype_to_string(subtype)
+                size = finger.get('valueSize', 0)
+                print(
+                    f'  Finger DBID={finger["dbid"]:<5d} '
+                    f'subtype=0x{subtype:02x} ({subtype:3d}) '
+                    f'size={size:6d} bytes  '
+                    f'{family}  [{name}]'
+                )
+                if 1 <= subtype <= 10:
+                    linux_fingers += 1
+                elif 0xF5 <= subtype <= 0xFE:
+                    windows_fingers += 1
+                else:
+                    other_fingers += 1
+
+        print()
+        print('Summary')
+        print('-------')
+        print(f'Linux/fprintd fingerprints:       {linux_fingers}')
+        print(f'Windows Hello/private records:    {windows_fingers}')
+        print(f'Other/unknown fingerprint records:{other_fingers}')
+        print(f'DB free space:                    {human_bytes(info.free)}')
+        print(f'Deleted/slack not currently free: {human_bytes(reclaimable)}')
+
+        # Existing driver measurements showed a full finger template can be
+        # around 23 KiB. This is informational only; do not claim a fixed size.
+        if info.free < 24 * 1024:
+            print()
+            print('WARNING: Less than 24 KiB is free in the on-sensor database.')
+            print('A new fingerprint enrollment may fail for lack of contiguous/unallocated space.')
+
+        return 0
+
+    except Exception as exc:
+        print(f'validity-db-info: {exc}', file=sys.stderr)
+        return 2
+    finally:
+        if not args.no_service_control and was_active:
+            print()
+            print('Restarting python3-validity...')
+            systemctl('start', 'python3-validity.service')
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

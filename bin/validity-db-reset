@@ -1,0 +1,71 @@
+#!/usr/bin/python3
+import os
+import subprocess
+import sys
+
+
+BACKOFF_FILE = '/var/run/python-validity/backoff'
+
+
+def systemctl(*args):
+    return subprocess.run(['systemctl', *args], check=False)
+
+
+def clear_driver_backoff():
+    """Clear stale python-validity restart protection after DB maintenance."""
+    try:
+        os.remove(BACKOFF_FILE)
+        print('Cleared stale python-validity backoff state.')
+    except FileNotFoundError:
+        pass
+
+    # Also clear systemd's failed/restart state so the next manual start or
+    # reboot is not affected by an earlier crash loop.
+    systemctl('reset-failed', 'python3-validity.service')
+
+
+def main():
+    if os.geteuid() != 0:
+        print('Run with sudo: sudo validity-db-reset', file=sys.stderr)
+        return 1
+
+    print('python-validity shared fingerprint database reset')
+    print('================================================')
+    print()
+    print('WARNING: this erases BOTH Linux/fprintd and Windows Hello fingerprints')
+    print('stored in the fingerprint sensor database.')
+    print()
+    if input('Type ERASE to continue: ').strip() != 'ERASE':
+        print('Canceled.')
+        return 0
+
+    systemctl('stop', 'open-fprintd.service')
+    systemctl('stop', 'python3-validity.service')
+
+    # The service may have accumulated >10 starts/minute before the reset.
+    # Clear that stale state now, while the service is stopped, so the next
+    # boot/start cannot be rejected by dbus-service's backoff guard.
+    clear_driver_backoff()
+
+    from validitysensor.init import open as sensor_open
+    from validitysensor.flash import erase_flash
+
+    print('Opening fingerprint sensor...')
+    sensor_open()
+    print('Erasing database partition 4...')
+    erase_flash(4)
+
+    # Defensive second cleanup in case a stale state file was recreated by
+    # anything during direct sensor access.
+    clear_driver_backoff()
+
+    print()
+    print('Database erased successfully.')
+    print('python-validity restart/backoff state has been cleared.')
+    print('Reboot before enrolling again.')
+    print('For dual boot, enroll Windows Hello first, then Linux.')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

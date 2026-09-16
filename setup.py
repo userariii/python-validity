@@ -9,6 +9,8 @@ setup(name='python-validity',
       scripts=[
           'bin/validity-led-dance',
           'bin/validity-sensors-firmware',
+          'bin/validity-db-info',
+          'bin/validity-db-reset',
       ],
       install_requires=['cryptography >= 2.1.4', 'pyusb >= 1.0.0', 'pyyaml >= 3.12'],
       data_files=[
