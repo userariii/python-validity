@@ -1,0 +1,1 @@
+sudo systemctl stop python3-validity && sudo systemctl daemon-reload && sudo systemctl restart open-fprintd && sudo systemctl restart python3-validit
